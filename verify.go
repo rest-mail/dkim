@@ -1,0 +1,273 @@
+package dkim
+
+import (
+	"context"
+	"crypto"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/base64"
+	"fmt"
+	"net"
+	"strings"
+)
+
+// Verify performs RFC 6376 DKIM verification against a raw RFC 5322 message.
+//
+// Verification MUST run over the exact bytes that were signed — the header and
+// body as transmitted — so this operates on the raw message, never on a parsed
+// or reconstructed representation (reconstructing headers/body from structured
+// fields would not reproduce the signer's canonicalization for anything but the
+// simplest messages).
+//
+// It returns one VerifyResult per DKIM-Signature header found, in header order.
+// An empty slice means the message carried no DKIM-Signature. A nil resolver
+// uses the system DNS resolver.
+func Verify(ctx context.Context, rawMessage []byte, resolver TXTResolver) []VerifyResult {
+	if resolver == nil {
+		resolver = net.DefaultResolver.LookupTXT
+	}
+	headers, body := SplitMessage(rawMessage)
+
+	var results []VerifyResult
+	for _, h := range headers {
+		if !strings.EqualFold(h.Name, "DKIM-Signature") {
+			continue
+		}
+		results = append(results, VerifySignature(ctx, h, headers, body, resolver))
+	}
+	return results
+}
+
+// TXTResolver looks up DNS TXT records for a name. It matches the signature of
+// net.Resolver.LookupTXT so the default resolver can be used directly, and a
+// stub can be injected in tests.
+type TXTResolver func(ctx context.Context, name string) ([]string, error)
+
+// Verification result strings, mirroring RFC 8601 dkim= values.
+const (
+	ResultPass      = "pass"
+	ResultFail      = "fail"
+	ResultNeutral   = "neutral"
+	ResultNone      = "none"
+	ResultTempError = "temperror"
+	ResultPermError = "permerror"
+)
+
+// VerifyResult is the outcome of verifying a single DKIM-Signature.
+type VerifyResult struct {
+	Domain   string // d= signing domain
+	Selector string // s= selector
+	Result   string // one of the Result* constants
+	Reason   string // human-readable detail
+}
+
+// Header is one parsed header field of an RFC 5322 message: its name, its value
+// (everything after the colon, folding CRLFs preserved, trailing CRLF stripped)
+// and the full raw field. It is the unit SplitMessage produces and that
+// CanonicalizeHeader / VerifySignature / BuildSignedHeaders consume.
+type Header struct {
+	// Name is the field name, e.g. "From" (whitespace-trimmed, original case).
+	Name string
+	// Value is everything after the colon, with folding CRLFs preserved and the
+	// trailing CRLF stripped.
+	Value string
+	// Raw is the full field exactly as it appeared (name, colon, value, folds),
+	// with no trailing CRLF — used by simple header canonicalization.
+	Raw string
+}
+
+// VerifySignature verifies a single DKIM-style signature header (sig) against
+// the message it covers: allHeaders is the full ordered header block the
+// signature's h= tag selects from, and body is the CRLF-normalized body (both
+// as returned by SplitMessage). It performs body-hash, header-hash and public
+// key checks and returns a VerifyResult.
+//
+// It is the per-signature verification primitive underneath Verify. It is
+// exported so that layered schemes (e.g. ARC) can verify their DKIM-shaped
+// signature — an ARC-Message-Signature is structurally a DKIM-Signature — using
+// exactly the same canonicalization and crypto path.
+func VerifySignature(ctx context.Context, sig Header, allHeaders []Header, body string, resolver TXTResolver) VerifyResult {
+	tags := ParseTagList(sig.Value)
+
+	res := VerifyResult{Domain: tags["d"], Selector: tags["s"]}
+	permfail := func(reason string) VerifyResult { res.Result = ResultPermError; res.Reason = reason; return res }
+
+	if tags["v"] != "" && tags["v"] != "1" {
+		return permfail("unsupported DKIM version " + tags["v"])
+	}
+	for _, req := range []string{"a", "b", "bh", "d", "s", "h"} {
+		if tags[req] == "" {
+			return permfail("missing required tag " + req)
+		}
+	}
+
+	// Algorithm → hash.
+	var hashType crypto.Hash
+	switch strings.ToLower(tags["a"]) {
+	case "rsa-sha256":
+		hashType = crypto.SHA256
+	case "rsa-sha1":
+		hashType = crypto.SHA1
+	default:
+		return permfail("unsupported algorithm " + tags["a"])
+	}
+
+	// Canonicalization: c=header/body, default simple/simple.
+	headerCanon, bodyCanon := "simple", "simple"
+	if c := tags["c"]; c != "" {
+		parts := strings.SplitN(c, "/", 2)
+		headerCanon = parts[0]
+		if len(parts) == 2 && parts[1] != "" {
+			bodyCanon = parts[1]
+		} else {
+			bodyCanon = "simple" // "c=relaxed" means relaxed header, simple body
+		}
+	}
+	if headerCanon != "simple" && headerCanon != "relaxed" {
+		return permfail("unsupported header canonicalization " + headerCanon)
+	}
+	if bodyCanon != "simple" && bodyCanon != "relaxed" {
+		return permfail("unsupported body canonicalization " + bodyCanon)
+	}
+
+	// ── Body hash ────────────────────────────────────────────────────
+	canonBody := CanonicalizeBody(body, bodyCanon)
+	if l := tags["l"]; l != "" {
+		n, err := parseUint(l)
+		if err != nil {
+			return permfail("invalid l= tag")
+		}
+		if n < len(canonBody) {
+			canonBody = canonBody[:n]
+		}
+	}
+	computedBH := HashBytes(hashType, []byte(canonBody))
+	expectedBH, err := base64.StdEncoding.DecodeString(StripWSP(tags["bh"]))
+	if err != nil {
+		return permfail("invalid bh= base64")
+	}
+	if !bytesEqual(computedBH, expectedBH) {
+		res.Result = ResultFail
+		res.Reason = "body hash mismatch"
+		return res
+	}
+
+	// ── Header hash / signature ──────────────────────────────────────
+	signedData := BuildSignedHeaders(tags["h"], allHeaders, sig, headerCanon)
+
+	sigBytes, err := base64.StdEncoding.DecodeString(StripWSP(tags["b"]))
+	if err != nil {
+		return permfail("invalid b= base64")
+	}
+
+	// ── Public key via DNS ───────────────────────────────────────────
+	pub, kres := FetchKey(ctx, tags["s"], tags["d"], resolver)
+	if kres != "" {
+		res.Result = kres
+		res.Reason = "key lookup: " + res.Reason
+		if kres == ResultTempError {
+			res.Reason = "temporary DNS failure for " + RecordName(tags["s"], tags["d"])
+		} else {
+			res.Reason = "no valid key at " + RecordName(tags["s"], tags["d"])
+		}
+		return res
+	}
+
+	hashed := HashBytes(hashType, []byte(signedData))
+	if err := rsa.VerifyPKCS1v15(pub, hashType, hashed, sigBytes); err != nil {
+		res.Result = ResultFail
+		res.Reason = "signature verification failed"
+		return res
+	}
+
+	res.Result = ResultPass
+	res.Reason = fmt.Sprintf("signature ok (d=%s s=%s)", tags["d"], tags["s"])
+	return res
+}
+
+// FetchKey resolves and parses a signer's RSA public key from its DKIM key
+// record at <selector>._domainkey.<domain>. On success it returns (key, ""); on
+// failure it returns (nil, result) where result is ResultTempError (transient
+// DNS failure) or ResultPermError (missing, revoked or malformed key).
+func FetchKey(ctx context.Context, selector, domain string, resolver TXTResolver) (*rsa.PublicKey, string) {
+	name := RecordName(selector, domain)
+	records, err := resolver(ctx, name)
+	if err != nil {
+		var dnsErr *net.DNSError
+		if ok := asDNSError(err, &dnsErr); ok && dnsErr.IsNotFound {
+			return nil, ResultPermError
+		}
+		return nil, ResultTempError
+	}
+	for _, rec := range records {
+		kt := ParseTagList(rec)
+		if kt["p"] == "" {
+			continue // revoked or malformed
+		}
+		if k := kt["k"]; k != "" && !strings.EqualFold(k, "rsa") {
+			continue
+		}
+		der, derr := base64.StdEncoding.DecodeString(StripWSP(kt["p"]))
+		if derr != nil {
+			continue
+		}
+		pub, perr := x509.ParsePKIXPublicKey(der)
+		if perr != nil {
+			continue
+		}
+		if rsaKey, ok := pub.(*rsa.PublicKey); ok {
+			return rsaKey, ""
+		}
+	}
+	return nil, ResultPermError
+}
+
+// BuildSignedHeaders assembles the canonicalized header block that a signature's
+// b= tag signs: each header named in hTag (a colon-separated list, matched
+// bottom-up per RFC 6376 §5.4.2), followed by the signature header (sig) itself
+// with its b= value emptied and NO trailing CRLF.
+//
+// It is exported so a signer or a layered scheme (ARC's ARC-Message-Signature)
+// can produce the exact bytes VerifySignature will hash.
+func BuildSignedHeaders(hTag string, allHeaders []Header, sig Header, canon string) string {
+	// Track, per lowercased name, how many instances we've already consumed so
+	// repeated names match from the bottom of the header block upward (RFC 6376
+	// §5.4.2).
+	consumed := map[string]int{}
+	var b strings.Builder
+	for _, name := range strings.Split(hTag, ":") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		lname := strings.ToLower(name)
+		h := nthFromBottom(allHeaders, lname, consumed[lname])
+		consumed[lname]++
+		if h == nil {
+			continue // absent header contributes nothing
+		}
+		b.WriteString(CanonicalizeHeader(*h, canon))
+		b.WriteString("\r\n")
+	}
+	// The signature header being verified, b= emptied, no trailing CRLF.
+	stripped := sig
+	stripped.Value = RemoveBValue(sig.Value)
+	stripped.Raw = RemoveBValue(sig.Raw)
+	b.WriteString(CanonicalizeHeader(stripped, canon))
+	return b.String()
+}
+
+// nthFromBottom returns the nth (0-based) instance of the named header counting
+// from the bottom of the header block, or nil if there are fewer than n+1.
+func nthFromBottom(headers []Header, lname string, n int) *Header {
+	count := 0
+	for i := len(headers) - 1; i >= 0; i-- {
+		if strings.ToLower(headers[i].Name) == lname {
+			if count == n {
+				return &headers[i]
+			}
+			count++
+		}
+	}
+	return nil
+}
