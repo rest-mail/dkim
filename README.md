@@ -1,7 +1,7 @@
 # dkim
 
-[![CI](https://github.com/rest-mail/dkim/actions/workflows/ci.yml/badge.svg)](https://github.com/rest-mail/dkim/actions/workflows/ci.yml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/rest-mail/dkim.svg)](https://pkg.go.dev/github.com/rest-mail/dkim)
+[![CI](https://github.com/rest-mail/go-dkim/actions/workflows/ci.yml/badge.svg)](https://github.com/rest-mail/go-dkim/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/rest-mail/go-dkim.svg)](https://pkg.go.dev/github.com/rest-mail/go-dkim)
 
 DKIM ([RFC 6376](https://www.rfc-editor.org/rfc/rfc6376)) signing and
 verification for Go, with zero external dependencies (standard library only).
@@ -22,7 +22,7 @@ is structurally a DKIM-Signature — can reuse the exact same code path. See
 ## Install
 
 ```sh
-go get github.com/rest-mail/dkim
+go get github.com/rest-mail/go-dkim
 ```
 
 ## Sign
@@ -35,7 +35,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/rest-mail/dkim"
+	"github.com/rest-mail/go-dkim"
 )
 
 func main() {
@@ -85,7 +85,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/rest-mail/dkim"
+	"github.com/rest-mail/go-dkim"
 )
 
 func main() {
