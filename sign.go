@@ -50,10 +50,10 @@ var defaultSignedHeaders = []string{"from", "to", "subject", "date", "message-id
 // as "DKIM-Signature: " + value + "\r\n".
 //
 // Signing operates on the message's ACTUAL header/body bytes and shares its
-// canonicalization with Verify (via buildSignedHeaders / canonicalizeBody), so a
-// message signed here verifies here — and, because it signs the real transmitted
-// bytes rather than a reconstruction, at any RFC 6376 verifier. Only headers that
-// are actually present are included in h=.
+// canonicalization with Verify (via BuildSignedHeaders and CanonicalizeBody), so
+// a message signed here verifies here — and, because it signs the real
+// transmitted bytes rather than a reconstruction, at any RFC 6376 verifier. Only
+// headers that are actually present are included in h=.
 func Sign(rawMessage []byte, opt SignOptions) (string, error) {
 	if opt.Domain == "" || opt.Selector == "" || opt.PrivateKey == nil {
 		return "", fmt.Errorf("dkim.Sign: domain, selector and private key are required")

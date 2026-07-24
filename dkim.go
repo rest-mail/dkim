@@ -1,10 +1,49 @@
-// Package dkim generates DKIM signing keys and renders their DNS TXT records.
+// Package dkim signs and verifies email messages with DomainKeys Identified
+// Mail (DKIM, RFC 6376).
 //
-// The product can store a domain's DKIM private key (via PUT /api/v1/admin/dkim)
-// and sign with it in the pipeline, but it has no way to *generate* a keypair or
-// render the public key as the DNS record receivers verify against. This package
-// fills that gap so an instance can be given a working DKIM setup: generate a
-// keypair, install the private key via the admin API, and publish the record.
+// DKIM lets a domain take responsibility for a message by attaching a
+// cryptographic signature over selected header fields and the body. A verifier
+// fetches the signer's public key from DNS (at <selector>._domainkey.<domain>)
+// and confirms the message was not altered in transit.
+//
+// Signing and verification both operate on the raw RFC 5322 message bytes —
+// never on a parsed or reconstructed representation — so a signature is checked
+// against exactly what was transmitted. Both "simple" and "relaxed" header and
+// body canonicalization are supported; signing uses rsa-sha256, and
+// verification additionally accepts the legacy rsa-sha1 algorithm. The package
+// depends only on the Go standard library.
+//
+// # Signing
+//
+// Sign returns a DKIM-Signature field value over a raw message; the caller
+// prepends the header field name and a trailing CRLF:
+//
+//	value, err := dkim.Sign(raw, dkim.SignOptions{
+//		Domain:     "example.com",
+//		Selector:   "default",
+//		PrivateKey: key,
+//	})
+//	signed := append([]byte("DKIM-Signature: "+value+"\r\n"), raw...)
+//
+// GenerateKey, RecordName, RecordValue and RecordFragment produce a keypair and
+// render the public half as the DNS TXT record verifiers look up.
+//
+// # Verifying
+//
+// Verify returns one VerifyResult per DKIM-Signature header, in header order. A
+// nil resolver uses the system DNS resolver:
+//
+//	for _, r := range dkim.Verify(ctx, raw, nil) {
+//		fmt.Println(r.Domain, r.Result)
+//	}
+//
+// # Primitives
+//
+// The canonicalization and single-signature primitives (SplitMessage,
+// CanonicalizeHeader, CanonicalizeBody, BuildSignedHeaders, VerifySignature,
+// FetchKey, ParseTagList, RemoveBValue, StripWSP, HashBytes) are exported so
+// that layered schemes such as ARC — whose ARC-Message-Signature is
+// structurally a DKIM-Signature — can reuse the exact same code path.
 package dkim
 
 import (
@@ -17,13 +56,14 @@ import (
 	"strings"
 )
 
-// DefaultSelector is the selector the API's DNS health check looks up
-// (default._domainkey.<domain>). Keep in sync with internal/api/handlers.
+// DefaultSelector is the selector RecordName and RecordFragment fall back to
+// when none is given: "default", i.e. default._domainkey.<domain>.
 const DefaultSelector = "default"
 
-// GenerateKey creates an RSA DKIM keypair and returns both halves PEM-encoded.
-// The private PEM is what you install via the admin API; the public PEM feeds
-// RecordValue.
+// GenerateKey creates an RSA DKIM keypair of the given size in bits and returns
+// both halves PEM-encoded. The private PEM is the signing key (pass it to
+// ParsePrivateKey); the public PEM feeds RecordValue to build the DNS record.
+// Use at least 2048 bits for production keys.
 func GenerateKey(bits int) (privatePEM, publicPEM string, err error) {
 	key, err := rsa.GenerateKey(rand.Reader, bits)
 	if err != nil {
